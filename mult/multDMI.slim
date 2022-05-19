@@ -1,0 +1,385 @@
+//multiple incompatibilities
+
+initialize() {
+
+	/*----------------------------------------------------------------*/
+	/*										variables									*/
+	/*----------------------------------------------------------------*/
+	
+	//misc. simulation variables
+	if(!exists("N")) 							//numbers parents from each population
+		defineConstant("N", 500); 			//and number F1s produced
+	if(!exists("chrL")) 						//length of each chromosome
+		defineConstant("chrL", 1000);
+	if(!exists("numChr")) 					//number of chromosomes
+		defineConstant("numChr", 6);
+
+	//incompatibility variables
+	if(!exists("numPairs")) 				//number of incompatibility pairs
+		defineConstant("numPairs", 3); 	//set to 3 arbitrarily
+	if(!exists("fitMean")) 					//mean fitness of the incompatibilities
+		defineConstant("fitMean", 0.5);	//0.5 is arbitrary
+	if(!exists("fitStdDev")) 				//std dev of fitness of incompatibilities
+		defineConstant("fitStdDev", 0.2); //for normal distribution
+	if(!exists("probIntra")) 				//probability of intrachromosomal incompatibilities
+		defineConstant("probIntra", 1 / numChr);
+	if(!exists("genoDec")) 					//decreasing chance of another genotype
+		defineConstant("genoDec", 0.5); 	//affected
+	if(!exists("neutral"))					//whether this is a neutral run
+		defineConstant("neutral", 0);
+
+	//output variables
+	if(!exists("simInfoOutPath"))			//simulation information
+		defineConstant("simInfoOutPath", "testMultDMI1.csv");
+	if(!exists("ancPopOutPath"))			//population ancestry
+		defineConstant("ancPopOutPath", paste(c("a_p_", getSeed(), ".csv"), sep = ""));
+	if(!exists("ancIndOutPath"))			//individual ancestry
+		defineConstant("ancIndOutPath", paste(c("a_i_", getSeed(), ".txt"), sep = ""));
+	if(!exists("saveIndData")) 			//whether to save individual ancestry
+		defineConstant("saveIndData", F);
+	if(!exists("fitOutPath"))
+		defineConstant("fitOutPath", paste(c("f_", getSeed(), ".csv"), sep = ""));
+	if(!exists("posOutPath"))
+		defineConstant("posOutPath", paste(c("p_", getSeed(), ".csv"), sep = ""));
+
+	/*----------------------------------------------------------------*/
+	/*									initializations								*/
+	/*----------------------------------------------------------------*/
+	initializeSLiMModelType("nonWF");
+	initializeMutationRate(0);
+	
+	// mutations
+	initializeMutationType(1, 0.5, "f", 0.0); //p1 allele for incompatibilities
+	initializeMutationType(2, 0.5, "f", 0.0); //p2 allele for incompatibilities
+	initializeMutationType(3, 0.5, "f", 0.0); //p2 marker at every locus
+	m1.convertToSubstitution = F;
+	m2.convertToSubstitution = F;
+	m3.convertToSubstitution = F;
+	
+	/*----------------------------------------------------------------*/
+	/*							chromosomes calculations							*/
+	/*----------------------------------------------------------------*/
+
+	//calculate chromosome breaks
+	chrEnd = (chrL * numChr) - 1;
+	
+	chrBreaksEnd = seq(from = chrL, to = chrEnd, by = chrL);
+	chrBreaksStart = chrBreaksEnd - 1;
+	
+	normalRecomRate = (chrL) ^ -1;
+	//normalRecomRate = 1e-9; //useful for viewing the chromosome breaks in SLiMgui
+										//otherwise the recom. rate is too high to see them
+	
+	//create recombination breakpoints for each chromosome
+	recomBreaks = sapply(0:(numChr - 2), 
+								"c(chrBreaksStart[applyValue], chrBreaksEnd[applyValue]);");
+	recomRates = rep(c(normalRecomRate, 0.5), (numChr - 1));
+
+	//initialize genome with chromosome breaks
+	initializeGenomicElementType("g1", m3, 1.0);
+	initializeGenomicElement(g1, 0, chrEnd);
+	initializeRecombinationRate(c(recomRates, normalRecomRate), 
+										c(recomBreaks, chrEnd));
+
+	/*----------------------------------------------------------------*/
+	/*						incompatibility pair locations						*/
+	/*----------------------------------------------------------------*/
+
+	//pairLocs is a list of pairs; the first index is the location
+	//of the p1-derived allele; the second index is the location
+	//of the p2-derived allele.
+	pairLocs = matrix(rep(-1, numPairs * 2), ncol = 2);
+
+	//determine which pairs are intrachromosomal, based off probIntra
+	//ahead of time
+	isIntra = sample(c(T, F), numPairs, replace = T, 
+							weights = c(probIntra, 1.0 - probIntra));
+
+	for(i in 0:(numPairs - 1)){
+		//determine the chromosome for the p1 allele
+		chrA = sample(0:(numChr - 1), 1);
+			
+		//determine the chromosome for the p2 allele
+		//if intrachromosomal
+		if(isIntra[i]){
+			chrB = chrA;
+		}
+		//if not intrachromosomal, sample from the remaining chromosomes
+		else{
+			otherChrs = setSymmetricDifference(chrA, 0:(numChr - 1));
+			chrB = sample(otherChrs, 1);
+		}
+		
+		//determine position on the respective chromosomes
+		chrPos = sample(0:(chrL - 1), 2);		
+		
+		//use the chromosome numbers & positions to determine
+		//location on the genome for both mutations
+		pairLocs[i, 0] = (chrA * chrL) + chrPos[0];
+		pairLocs[i, 1] = (chrB * chrL) + chrPos[1];
+	}
+	
+	/*----------------------------------------------------------------*/
+	/*							incompatibility pair fitness						*/
+	/*----------------------------------------------------------------*/
+	
+	if(neutral){
+		fitnesses = rep(1, numPairs);
+	}
+	else{
+		//determine fitness values as normally distributed
+		//around fitMean
+		fitnesses = rnorm(numPairs, fitMean, fitStdDev);
+		//adjust fitnesses to be within [0, 0.99]
+		fitnesses[which(fitnesses > 0.99)] = 0.99;
+		fitnesses[which(fitnesses < 0.0)] = 0.0;
+	}
+	
+	//make fitness matrix
+	//each column is an incompatibility pair
+	//each row is a genotype
+	//each entry is the fitness of that genotype
+	pairFit = matrix(rep(1.0, numPairs * 9), nrow = 9);
+	
+	//determine whether to add another affected
+	//genotype ahead of time
+	//using genoDec
+	additional = sample(c(T, F), 
+								size = 2 * numPairs, 
+								replace = T, 
+								weights = c(1.0 - genoDec, genoDec));
+		
+	//iterate through the pairs and assign fitnesses
+	for(i in 0:(numPairs - 1)){
+		//only allow three possible genotypes to be affected
+		//under DMI model & excluding heterozygous at both
+		//loci, to avoid the issues with a greatly reduced
+		//F1 population
+		
+		fitIndices = sample(c(5, 7, 8), 3, F);
+		
+		//assign the first fitness
+		pairFit[fitIndices[0], i] = fitnesses[i];
+		
+		//add additional affected genotypes
+		for(j in 0:1){
+			if(additional[(i * 2) + j]){
+				pairFit[fitIndices[j + 1], i] = fitnesses[i];
+			}
+			else break;
+		}
+	}
+
+	//save constants calculated
+	defineConstant("pairFitness", pairFit);
+	defineConstant("pairLocations", pairLocs);
+	defineConstant("chromosomeEnd", chrEnd);
+
+}
+
+/*----------------------------------------------------------------*/
+/*								other simulation events							*/
+/*----------------------------------------------------------------*/
+
+//adjust fitness for age
+early(){
+	old = sim.subpopulations.individuals[sim.subpopulations.individuals.age >= 1];
+	old.fitnessScaling = 0;
+}
+
+
+//adjust viability of offspring based off fitness
+modifyChild() {
+	//p1-derived mutations
+	num1 = asInteger(child.genome1.containsMutations(muts1)) + 
+			 asInteger(child.genome2.containsMutations(muts1));
+	//p2-derived mutations
+	num2 = asInteger(child.genome1.containsMutations(muts2)) + 
+			 asInteger(child.genome2.containsMutations(muts2));
+
+	//get indices of the appropriate genotype
+	genoIndices = num1 + (num2 * 3);
+	matIndices = genoIndices + ((0:(numPairs - 1)) * 9);
+	//get fitness values of the genotypes
+	allFit = pairFitness[matIndices];
+	
+	//fitness is multiplicative
+	//multiply fitness effects from all genotypes
+	viability = product(allFit);
+
+	//randomly draw based on viability
+	if(rbinom(1, 1, viability)){
+		return T; //the offspring survives
+	}
+	else{
+		return F; //the offspring dies
+	}
+}
+
+
+/*----------------------------------------------------------------*/
+/*									generation events								*/
+/*----------------------------------------------------------------*/
+
+//generation 1: set up parental populations
+1 early(){
+	sim.addSubpop("p1", N);
+	sim.addSubpop("p2", N);
+	sim.addSubpop("p3", 0);
+
+	//add fixed mutations to p1 and p2
+	a1 = p1.genomes.addNewMutation(m1, 0.0, pairLocations[,0]);
+	a2 = p2.genomes.addNewMutation(m2, 0.0, pairLocations[,1]);
+
+	//save the mutations
+	defineConstant("muts1", a1);
+	defineConstant("muts2", a2);
+
+	//add marker mutations to p2
+	p2.genomes.addNewMutation(m3, 0.0, 0:chromosomeEnd);
+}
+
+
+//generation 2: create F1s in p3
+//and prevent p1 & p2 from growing
+2 reproduction() {
+	//sample N parents from both p1 and p2
+	parentsP1 = p1.sampleIndividuals(N);
+	parentsP2 = p2.sampleIndividuals(N);
+	
+	//add children produced to p3
+	sapply((0:(length(parentsP1) - 1)),
+			 "p3.addCrossed(parentsP1[applyValue],parentsP2[applyValue]);");
+	
+	//disable call for this generation
+	self.active = 0;
+}
+
+//generation 2: remove p1 & p2
+//as they are no longer necessary
+2 late() {
+	p1.removeSubpopulation();
+	p2.removeSubpopulation();
+}
+
+//generation 3: generate F2s
+3: reproduction(){
+	//reproduce by randomly sampling a mate
+	//(note: selfing is therefore possible but rare)
+	subpop.addCrossed(individual, subpop.sampleIndividuals(1));
+}
+
+/*----------------------------------------------------------------*/
+/*								helper output functions							*/
+/*----------------------------------------------------------------*/
+
+//get number of p2 markers for an individual over the entire chromosome
+function (string)getIndMarkers(o<Individual>ind){
+	mark1 = integer(chromosomeEnd + 1, 0, 1, ind.genome1.positionsOfMutationsOfType(m3));
+	mark2 = integer(chromosomeEnd + 1, 0, 1, ind.genome2.positionsOfMutationsOfType(m3));
+	sumMark = mark1 + mark2;
+	
+	//format as a string and return
+	return paste(sumMark, sep = "");
+}
+
+//get counts of genotypes at a certain locus
+function (integer)ancAtLoc(o<Subpopulation> p, integer i){
+	gen1 = p.individuals.genome1.containsMarkerMutation(m3, i);
+	gen2 = p.individuals.genome2.containsMarkerMutation(m3, i);
+	anc = asInteger(gen1) + asInteger(gen2);
+	numHomo1 = sum(anc == 0);
+	numHet = sum(anc == 1);
+	numHomo2 = sum(anc == 2);
+	
+	return c(numHomo1, numHet, numHomo2);
+}
+
+//get counts of genotypes over the entire p3
+function (integer)ancOverGenome(void){
+	smth = sapply(0:chromosomeEnd,
+			"ancAtLoc(p3, applyValue);");
+			
+	asMat = matrix(smth, nrow = 3);			
+			
+	return asMat;
+}
+
+function (string)matrixToCsv(* mat){
+	nrows = dim(mat)[0];
+	ncols = dim(mat)[1];
+	
+	rows = sapply(0:(nrows - 1), "paste(mat[applyValue,], sep = ',');");
+	total = paste(rows, sep = "\n");
+	
+	return total;
+}
+
+/*----------------------------------------------------------------*/
+/*									end of simulation								*/
+/*----------------------------------------------------------------*/
+
+3 late(){
+	/*----------------------------------------------------------------*/
+	/*								write simulation info							*/
+	/*----------------------------------------------------------------*/
+	line = paste(c(getSeed(),
+						ancPopOutPath,
+						ancIndOutPath,
+						saveIndData,
+						fitOutPath,
+						posOutPath,
+						
+						N,
+						p3.individualCount,
+
+						chrL,
+						numChr,
+						
+						numPairs,
+						fitMean,
+						fitStdDev,
+						probIntra,
+						genoDec
+						), 
+					sep = ",");
+	
+	writeFile(simInfoOutPath,
+				line,
+				append = T);	
+
+	writeFile(fitOutPath,
+				matrixToCsv(pairFitness));
+	
+	writeFile(posOutPath,
+				matrixToCsv(pairLocations));
+
+	/*----------------------------------------------------------------*/
+	/*							write population ancestry							*/
+	/*----------------------------------------------------------------*/
+	genotypeSums = ancOverGenome();
+	
+	//write sum of genotypes
+	for(i in 0:2){
+		writeFile(ancPopOutPath,
+					paste(genotypeSums[i,], sep = ","),
+					append = T);
+	}
+	
+	/*----------------------------------------------------------------*/
+	/*							write individual ancestry							*/
+	/*----------------------------------------------------------------*/
+
+	if(saveIndData){
+		for(ind in p3.individuals){
+			writeFile(ancIndOutPath,
+						getIndMarkers(ind),
+						append = T);
+		}
+	}
+
+	/*----------------------------------------------------------------*/
+	/*									end simulation									*/
+	/*----------------------------------------------------------------*/
+	sim.simulationFinished();
+}
